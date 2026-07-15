@@ -1,0 +1,851 @@
+import React, { useState, useMemo, useRef, useEffect } from "react";
+import {
+  ComposedChart, Line, Bar, Cell, XAxis, YAxis, Tooltip, Legend,
+  ResponsiveContainer, CartesianGrid, ReferenceLine, BarChart, LabelList,
+} from "recharts";
+
+/* ================= design tokens: ledger-green planning workbench ================= */
+const T = {
+  bg: "#F2F4F1", panel: "#FFFFFF", ink: "#14211C", sub: "#5C6B64", line: "#E2E7E3",
+  green: "#1B5E4A", mint: "#17A673", opt: "#8FBF9F", pess: "#D08C3C", red: "#B54A32",
+  mono: "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace",
+  sans: "'Space Grotesk', -apple-system, 'Segoe UI', sans-serif",
+};
+const card = { background: T.panel, border: `1px solid ${T.line}`, borderRadius: 10, padding: 14 };
+
+/* ================= time & data model ================= */
+const MN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const DEFAULT_SEGS = ["Retail", "Wholesale", "Online"];
+const PALETTE = ["#1B5E4A", "#4E8D77", "#D08C3C", "#7A6A9E", "#B54A32", "#3F7CAC", "#8A8635", "#A65E7E"];
+const H = 6; // forecast horizon (months)
+
+const mAdd = (y, m, k) => ({ y: y + Math.floor((m + k) / 12), m: (m + k) % 12 });
+const mKey = (y, m) => `${MN[m]} '${String(y).slice(2)}`;
+
+function genSample() {
+  const SEGS = DEFAULT_SEGS;
+  const startY = 2025, startM = 6, N = 12; // Jul '25 → Jun '26
+  const base = { Retail: 520, Wholesale: 310, Online: 190 };       // $K / month
+  const g    = { Retail: 0.008, Wholesale: 0.003, Online: 0.024 }; // true monthly growth
+  const season = [1.04, 0.97, 1.0, 1.02, 1.06, 0.95, 0.98, 1.0, 1.03, 1.05, 1.12, 1.08];
+  const values = {};
+  SEGS.forEach(s => {
+    values[s] = [];
+    for (let i = 0; i < N; i++) {
+      const { m } = mAdd(startY, startM, i);
+      const noise = 1 + (Math.random() - 0.5) * 0.08;
+      values[s].push(Math.round(base[s] * Math.pow(1 + g[s], i) * season[m] * noise));
+    }
+  });
+  return { startY, startM, segs: SEGS, values };
+}
+
+/* ---- CSV loader: wide format `month, Segment1, Segment2, ...`; daily rows auto-aggregate to months ---- */
+function parseCSVMonthly(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 3) throw new Error("Need a header row plus at least 6 data rows.");
+  const split = l => l.split(/[,;\t]/).map(s => s.trim());
+  const head = split(lines[0]);
+  const segs = head.slice(1).filter(Boolean);
+  if (!segs.length) throw new Error("Header must be: month, Segment1, Segment2, …");
+  const bucket = new Map(); // "y-m" -> {y,m,vals[]}
+  for (let i = 1; i < lines.length; i++) {
+    const p = split(lines[i]);
+    if (p.length < 2) continue;
+    let d = new Date(p[0]);
+    if (isNaN(d.getTime())) d = new Date(p[0] + "-01");
+    if (isNaN(d.getTime())) continue;
+    const key = d.getFullYear() + "-" + d.getMonth();
+    if (!bucket.has(key)) bucket.set(key, { y: d.getFullYear(), m: d.getMonth(), vals: Array(segs.length).fill(0) });
+    const b = bucket.get(key);
+    segs.forEach((_, j) => {
+      const v = parseFloat((p[j + 1] || "").replace(/[^0-9.\-]/g, ""));
+      if (!isNaN(v)) b.vals[j] += v;
+    });
+  }
+  const rows = [...bucket.values()].sort((a, b) => a.y - b.y || a.m - b.m);
+  if (rows.length < 6) throw new Error("Need at least 6 months of data (found " + rows.length + ").");
+  const values = {};
+  segs.forEach((s, j) => { values[s] = rows.map(r => Math.round(r.vals[j] * 100) / 100); });
+  return { startY: rows[0].y, startM: rows[0].m, segs, values };
+}
+
+/* seed scenario drivers from each segment's trailing monthly growth */
+function seedDrivers(actuals) {
+  const d = {};
+  actuals.segs.forEach(s => {
+    const v = actuals.values[s].slice(-12);
+    const first = v[0] || 1, last = v[v.length - 1] || 1, n = v.length - 1 || 1;
+    let g = (Math.pow(Math.max(last, 0.01) / Math.max(first, 0.01), 1 / n) - 1) * 100;
+    g = Math.max(-8, Math.min(8, +g.toFixed(1)));
+    d[s] = { pess: +(g - 2).toFixed(1), base: g, opt: +(g + 2).toFixed(1) };
+  });
+  return d;
+}
+
+/* ================= planning engine (Anaplan-style) ================= */
+function buildPlan(actuals, drivers, probs, overrides) {
+  const SEGS = actuals.segs;
+  const N = actuals.values[SEGS[0]].length;
+  const pSum = probs.pess + probs.base + probs.opt || 1;
+  const P = { pess: probs.pess / pSum, base: probs.base / pSum, opt: probs.opt / pSum };
+  const months = [];
+  for (let k = 1; k <= H; k++) {
+    const { y, m } = mAdd(actuals.startY, actuals.startM, N - 1 + k);
+    const key = mKey(y, m);
+    const mult = overrides[key] ?? 1;
+    const perSeg = {}, totals = { pess: 0, base: 0, opt: 0, ev: 0 };
+    SEGS.forEach(s => {
+      const anchor = actuals.values[s][N - 1];
+      const d = drivers[s];
+      const pess = anchor * Math.pow(1 + d.pess / 100, k) * mult;
+      const base = anchor * Math.pow(1 + d.base / 100, k) * mult;
+      const opt  = anchor * Math.pow(1 + d.opt  / 100, k) * mult;
+      const ev = P.pess * pess + P.base * base + P.opt * opt;
+      perSeg[s] = { pess, base, opt, ev };
+      totals.pess += pess; totals.base += base; totals.opt += opt; totals.ev += ev;
+    });
+    months.push({ key, k, perSeg, totals, overridden: overrides[key] != null });
+  }
+  return { months, P };
+}
+
+const fmtK = n => n == null ? "—" : "$" + Math.round(n).toLocaleString("en-US") + "K";
+const fmtPct = n => (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
+
+/* ================= AI agent ================= */
+function agentContext(actuals, plan, drivers, budget, accuracyLog, probs) {
+  const SEGS = actuals.segs;
+  const N = actuals.values[SEGS[0]].length;
+  const actLines = SEGS.map(s => {
+    const v = actuals.values[s];
+    return `${s}: last 6 actuals ${v.slice(-6).map(x => Math.round(x)).join(", ")} ($K/mo)`;
+  }).join("\n");
+  const drvLines = SEGS.map(s => `${s}: pess ${drivers[s].pess}%, base ${drivers[s].base}%, opt ${drivers[s].opt}% monthly`).join("; ");
+  const fcLines = plan.months.map(mo =>
+    `${mo.key}: EV ${Math.round(mo.totals.ev)} (pess ${Math.round(mo.totals.pess)} / base ${Math.round(mo.totals.base)} / opt ${Math.round(mo.totals.opt)})${mo.overridden ? " [manual override]" : ""}`
+  ).join("\n");
+  const budLines = Object.keys(budget).length
+    ? plan.months.filter(mo => budget[mo.key]).map(mo => {
+        const b = budget[mo.key].total, f = mo.totals.ev, v = f - b;
+        return `${mo.key}: budget ${Math.round(b)}, forecast EV ${Math.round(f)}, var ${v >= 0 ? "+" : ""}${Math.round(v)} (${((v / b) * 100).toFixed(1)}%)`;
+      }).join("\n")
+    : "no budget snapshot";
+  const acc = accuracyLog.length
+    ? accuracyLog.map(a => `${a.month}: predicted ${Math.round(a.predicted)}, actual ${Math.round(a.actual)}, err ${(Math.abs(a.actual - a.predicted) / a.actual * 100).toFixed(1)}%`).join("\n")
+    : "no landed months yet";
+  return `Connected sales planning model, ${SEGS.length} segments (${SEGS.join(", ")}), monthly, values in K. ${N} months of actuals; ${H}-month rolling forecast anchored on last actual, driver-based, scenario probabilities pess/base/opt = ${probs.pess}/${probs.base}/${probs.opt}.
+ACTUALS:
+${actLines}
+DRIVERS (monthly growth): ${drvLines}
+FORECAST:
+${fcLines}
+BUDGET vs FORECAST:
+${budLines}
+FORECAST ACCURACY LOG (landed actuals vs prediction at landing):
+${acc}`;
+}
+
+async function callAgent(messages, system) {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, system, messages }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error.message || "API error");
+  return data.content.filter(c => c.type === "text").map(c => c.text).join("\n").trim();
+}
+const SYSTEM = "You are an FP&A planning agent embedded in a connected-planning app. Be concise, numeric, decision-oriented. Figures in $K with commas. State variances three ways where relevant: absolute, %, and vs which scenario. Follow: what happened → why → what to change in the model → what constraint to protect. Never invent numbers absent from the context.";
+
+/* ================= small UI pieces ================= */
+function KPI({ label, value, sub, accent }) {
+  return (
+    <div style={{ ...card, flex: "1 1 130px", minWidth: 130 }}>
+      <div style={{ fontSize: 11, letterSpacing: 0.6, textTransform: "uppercase", color: T.sub }}>{label}</div>
+      <div style={{ fontFamily: T.mono, fontSize: 21, fontWeight: 600, color: accent || T.ink, marginTop: 4 }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: T.sub, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+const numIn = { width: 64, padding: "6px 6px", border: `1px solid ${T.line}`, borderRadius: 6, fontFamily: T.mono, fontSize: 13, textAlign: "right" };
+
+/* ================= main app ================= */
+export default function PlanningWorkbench() {
+  const [actuals, setActuals] = useState(null);
+  const fileRef = useRef(null);
+  const [autoPilot, setAutoPilot] = useState(true);
+  const [notifications, setNotifications] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [suggested, setSuggested] = useState([]);
+  const [emailDraft, setEmailDraft] = useState(null);
+  const [pipeline, setPipeline] = useState(null);
+  const [drivers, setDrivers] = useState({
+    Retail: { pess: -0.5, base: 0.8, opt: 2.0 },
+    Wholesale: { pess: -1.0, base: 0.3, opt: 1.2 },
+    Online: { pess: 0.5, base: 2.4, opt: 4.0 },
+  });
+  const [probs, setProbs] = useState({ pess: 25, base: 50, opt: 25 });
+  const [overrides, setOverrides] = useState({});
+  const [budget, setBudget] = useState({});
+  const [accuracyLog, setAccuracyLog] = useState([]);
+  const [selSeg, setSelSeg] = useState(null);            // cross-filter
+  const [tab, setTab] = useState("dash");
+  const [commentary, setCommentary] = useState("");
+  const [chat, setChat] = useState([]);
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const chatEnd = useRef(null);
+
+  const SEGS = actuals ? actuals.segs : DEFAULT_SEGS;
+  const colorOf = s => PALETTE[SEGS.indexOf(s) % PALETTE.length];
+
+  const notify = (type, text) => setNotifications(n => [{ id: Date.now() + Math.random(), ts: new Date(), type, text }, ...n].slice(0, 30));
+
+  const plan = useMemo(() => actuals ? buildPlan(actuals, drivers, probs, overrides) : null,
+    [actuals, drivers, probs, overrides]);
+  useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [chat, commentary]);
+
+  function initModel(a, drv) {
+    setActuals(a); setDrivers(drv); setOverrides({}); setAccuracyLog([]); setSelSeg(null);
+    setCommentary(""); setChat([]); setErr("");
+    setTasks([]); setSuggested([]); setEmailDraft(null); setPipeline(null);
+    setNotifications([{ id: Date.now(), ts: new Date(), type: "data", text: `Actuals detected: ${a.segs.length} segments · ${a.values[a.segs[0]].length} months of history. Forecast built, drivers seeded, budget snapshotted.` }]);
+    const p = buildPlan(a, drv, probs, {});
+    const b = {};
+    p.months.forEach(mo => {
+      b[mo.key] = { total: mo.totals.ev, perSeg: Object.fromEntries(a.segs.map(s => [s, mo.perSeg[s].ev])) };
+    });
+    setBudget(b);
+  }
+
+  function loadSample() {
+    initModel(genSample(), {
+      Retail: { pess: -0.5, base: 0.8, opt: 2.0 },
+      Wholesale: { pess: -1.0, base: 0.3, opt: 1.2 },
+      Online: { pess: 0.5, base: 2.4, opt: 4.0 },
+    });
+  }
+
+  function onCSVFile(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const a = parseCSVMonthly(String(reader.result));
+        initModel(a, seedDrivers(a));
+      } catch (ex) {
+        setErr(`${f.name}: ${ex.message} Expected format — header "month, Segment1, Segment2, …", then one row per month (or per day; daily rows are summed into months).`);
+      }
+    };
+    reader.onerror = () => setErr(`Couldn't read ${f.name}.`);
+    reader.readAsText(f);
+    e.target.value = "";
+  }
+
+
+  function snapshotBudget() {
+    if (!plan) return;
+    const b = { ...budget };
+    plan.months.forEach(mo => {
+      b[mo.key] = { total: mo.totals.ev, perSeg: Object.fromEntries(SEGS.map(s => [s, mo.perSeg[s].ev])) };
+    });
+    setBudget(b);
+  }
+
+  const PIPE = ["Actuals detected", "Forecast re-based", "Commentary generated", "Manager notified", "Actions suggested", "Review task opened"];
+  const pipeAt = (i, st) => setPipeline({ steps: PIPE.map((s, j) => ({ label: s, status: j < i ? "done" : j === i ? st : "pending" })) });
+
+  async function landActuals() {
+    if (!plan || !actuals || busy) return;
+    const next = plan.months[0];
+    const newVals = {}; let actualTotal = 0;
+    SEGS.forEach(s => {
+      const noise = 0.94 + Math.random() * 0.14;
+      const v = Math.round(next.perSeg[s].base * noise);
+      newVals[s] = [...actuals.values[s], v];
+      actualTotal += v;
+    });
+    const newActuals = { ...actuals, values: newVals };
+    const newOverrides = { ...overrides }; delete newOverrides[next.key];
+    const newLog = [...accuracyLog, { month: next.key, predicted: next.totals.ev, actual: actualTotal }];
+    setAccuracyLog(newLog);
+    setActuals(newActuals);
+    setOverrides(newOverrides); // rolling re-base
+
+    const variance = ((actualTotal - next.totals.ev) / next.totals.ev) * 100;
+    notify("close", `${next.key} actuals landed: ${fmtK(actualTotal)} vs forecast EV ${fmtK(next.totals.ev)} (${fmtPct(variance)}). Forecast re-based on the new anchor.`);
+    const task = { id: Date.now(), month: next.key, title: `Review ${next.key} close & re-based forecast`, variance, status: "Open", opened: new Date() };
+    setTasks(t => [task, ...t]);
+    notify("task", `Review task opened: ${task.title}`);
+
+    if (!autoPilot) { notify("info", "Autopilot is off — generate commentary manually from the AI agent tab."); return; }
+
+    setTab("workflow"); setBusy(true); pipeAt(2, "running");
+    try {
+      const newPlan = buildPlan(newActuals, drivers, probs, newOverrides);
+      const ctx = agentContext(newActuals, newPlan, drivers, budget, newLog, probs);
+      const raw = await callAgent([{
+        role: "user",
+        content: `${ctx}\n\n${next.key} actuals just landed: predicted EV ${Math.round(next.totals.ev)}, actual ${Math.round(actualTotal)}, variance ${variance.toFixed(1)}%.\nRespond ONLY with valid JSON, no markdown fences, exactly this shape:\n{"commentary":"CFO-ready commentary, max 130 words: what happened, why, what to change in the model, what constraint to protect","actions":[{"title":"imperative planning action","detail":"one sentence with numbers"},{"title":"...","detail":"..."},{"title":"...","detail":"..."}],"email":{"subject":"short subject with month and variance","body":"80-110 word plain-text notification to the FP&A manager summarizing close, variance, re-based outlook, and the open review task. Signed: Planning Workbench (automated)"}}`,
+      }], SYSTEM);
+      let parsed;
+      try { parsed = JSON.parse(raw.replace(/```json|```/g, "").trim()); }
+      catch { parsed = { commentary: raw, actions: [], email: null }; }
+      setCommentary(parsed.commentary || raw);
+      notify("agent", `Commentary generated for ${next.key} close.`);
+      pipeAt(3, "running");
+      if (parsed.email && parsed.email.subject) {
+        setEmailDraft(parsed.email);
+        notify("email", `FP&A manager notified — draft ready: "${parsed.email.subject}"`);
+      }
+      pipeAt(4, "running");
+      if (parsed.actions && parsed.actions.length) {
+        setSuggested(parsed.actions.map((a, i) => ({ id: Date.now() + i + 1, ...a })));
+        notify("action", `${parsed.actions.length} planning actions suggested.`);
+      }
+      setPipeline({ steps: PIPE.map(s => ({ label: s, status: "done" })) });
+    } catch (e) {
+      notify("error", "Pipeline: agent step failed — " + e.message);
+      setPipeline(p => p ? { steps: p.steps.map(s => s.status === "running" ? { ...s, status: "error" } : s) } : p);
+    }
+    setBusy(false);
+  }
+
+  const setTaskStatus = (id, status) => setTasks(ts => ts.map(t => t.id === id ? { ...t, status, closed: new Date() } : t));
+  const logActionAsTask = a => {
+    setTasks(t => [{ id: Date.now(), month: "plan", title: a.title, variance: null, status: "Open", opened: new Date() }, ...t]);
+    setSuggested(s => s.filter(x => x.id !== a.id));
+    notify("task", `Task opened: ${a.title}`);
+  };
+
+  function setOverrideTotal(mo, txt) {
+    const v = parseFloat(txt);
+    if (isNaN(v) || v <= 0) return;
+    const baseTotal = mo.totals.ev / (overrides[mo.key] ?? 1);
+    setOverrides(o => ({ ...o, [mo.key]: v / baseTotal }));
+  }
+
+  /* ---------- derived chart data ---------- */
+  const N = actuals ? actuals.values[SEGS[0]].length : 0;
+  const fanData = useMemo(() => {
+    if (!plan || !actuals) return [];
+    const pick = seg => seg ? (arr) => arr[seg] : null;
+    const hist = [];
+    for (let i = Math.max(0, N - 12); i < N; i++) {
+      const { y, m } = mAdd(actuals.startY, actuals.startM, i);
+      const val = selSeg ? actuals.values[selSeg][i] : SEGS.reduce((a, s) => a + actuals.values[s][i], 0);
+      hist.push({ name: mKey(y, m), actual: Math.round(val) });
+    }
+    const lastVal = hist[hist.length - 1].actual;
+    hist[hist.length - 1] = { ...hist[hist.length - 1], pess: lastVal, base: lastVal, opt: lastVal, ev: lastVal };
+    plan.months.forEach(mo => {
+      const src = selSeg ? mo.perSeg[selSeg] : mo.totals;
+      hist.push({ name: mo.key, pess: Math.round(src.pess), base: Math.round(src.base), opt: Math.round(src.opt), ev: Math.round(src.ev) });
+    });
+    return hist;
+  }, [plan, actuals, selSeg, N]);
+
+  const bridgeMonth = plan?.months.find(mo => budget[mo.key]) || null;
+  const bridgeData = useMemo(() => {
+    if (!plan || !bridgeMonth) return [];
+    const b = budget[bridgeMonth.key];
+    const rows = [{ name: "Budget", base: 0, val: b.total, kind: "start" }];
+    let cum = b.total;
+    SEGS.forEach(s => {
+      const delta = bridgeMonth.perSeg[s].ev - b.perSeg[s];
+      rows.push({ name: s, base: Math.min(cum, cum + delta), val: Math.abs(delta), delta, kind: "delta" });
+      cum += delta;
+    });
+    rows.push({ name: "Forecast", base: 0, val: cum, kind: "end" });
+    return rows.map(r => ({ ...r, base: Math.round(r.base), val: Math.round(r.val) }));
+  }, [plan, bridgeMonth, budget]);
+
+  const varTable = useMemo(() => {
+    if (!plan) return [];
+    return SEGS.map(s => {
+      let bud = 0, fc = 0;
+      plan.months.forEach(mo => {
+        if (budget[mo.key]) { bud += budget[mo.key].perSeg[s]; fc += mo.perSeg[s].ev; }
+      });
+      const v = fc - bud;
+      return { seg: s, bud, fc, v, pct: bud ? (v / bud) * 100 : 0 };
+    });
+  }, [plan, budget]);
+
+  const mapeAcc = accuracyLog.length
+    ? 100 - accuracyLog.reduce((a, x) => a + Math.abs(x.actual - x.predicted) / x.actual, 0) / accuracyLog.length * 100
+    : null;
+
+  const evTotal6 = plan ? plan.months.reduce((a, mo) => a + (selSeg ? mo.perSeg[selSeg].ev : mo.totals.ev), 0) : 0;
+  const budTotal6 = plan ? plan.months.reduce((a, mo) => a + (budget[mo.key] ? (selSeg ? budget[mo.key].perSeg[selSeg] : budget[mo.key].total) : 0), 0) : 0;
+
+  /* ---------- agent actions ---------- */
+  async function genCommentary() {
+    if (!plan) return;
+    setBusy(true); setErr(""); setCommentary(""); setTab("agent");
+    try {
+      const txt = await callAgent([{
+        role: "user",
+        content: `${agentContext(actuals, plan, drivers, budget, accuracyLog, probs)}\n\nWrite CFO-ready commentary (max ~200 words): trajectory read, budget-vs-forecast variance with named segment causes, accuracy note if landed months exist, then exactly 3 numbered imperative next moves.`,
+      }], SYSTEM);
+      setCommentary(txt);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+
+  async function ask() {
+    if (!q.trim() || !plan || busy) return;
+    const userMsg = q.trim(); setQ("");
+    const hist = [...chat, { role: "user", content: userMsg }];
+    setChat(hist); setBusy(true); setErr("");
+    try {
+      const msgs = [
+        { role: "user", content: `Model context for all questions:\n${agentContext(actuals, plan, drivers, budget, accuracyLog, probs)}` },
+        { role: "assistant", content: "Understood. I have the live model context." },
+        ...hist,
+      ];
+      const txt = await callAgent(msgs, SYSTEM + " Answer in under 120 words.");
+      setChat([...hist, { role: "assistant", content: txt }]);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+
+  const btn = primary => ({
+    padding: "9px 13px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+    border: primary ? "none" : `1px solid ${T.green}`,
+    background: primary ? T.green : "transparent", color: primary ? "#fff" : T.green, fontFamily: T.sans,
+  });
+  const tabBtn = id => ({
+    padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", border: "none",
+    background: tab === id ? T.green : "transparent", color: tab === id ? "#fff" : T.green, fontFamily: T.sans,
+  });
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.bg, color: T.ink, fontFamily: T.sans }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        input:focus, button:focus-visible { outline: 2px solid ${T.mint}; outline-offset: 1px; }
+        @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { padding: 8px 8px; font-size: 13px; border-bottom: 1px solid ${T.line}; text-align: right; }
+        th:first-child, td:first-child { text-align: left; }
+        th { color: ${T.sub}; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+      `}</style>
+
+      {/* header: ledger green-bar */}
+      <div style={{ padding: "18px 16px 14px", background: `repeating-linear-gradient(180deg, ${T.green} 0 28px, #17513F 28px 56px)`, color: "#EAF3EE" }}>
+        <div style={{ maxWidth: 1020, margin: "0 auto" }}>
+          <div style={{ fontSize: 11, letterSpacing: 2, textTransform: "uppercase", opacity: 0.8, fontFamily: T.mono }}>FP&A · Connected Planning Workbench</div>
+          <div style={{ fontSize: 23, fontWeight: 700, marginTop: 2 }}>Plan → Dashboard → Decide</div>
+          <div style={{ fontSize: 12.5, opacity: 0.85, marginTop: 4, maxWidth: 640 }}>
+            Driver-based scenarios, versions &amp; breakback (the Anaplan layer) · variance bridge, cross-filter &amp; KPIs (the Power BI layer) · AI commentary from live measures
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1020, margin: "0 auto", padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+
+        {/* controls */}
+        <div style={{ ...card, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <button style={btn(true)} onClick={loadSample}>Load sample model</button>
+          <button style={btn(false)} onClick={() => fileRef.current && fileRef.current.click()}>Upload CSV</button>
+          <input ref={fileRef} type="file" accept=".csv,.txt,text/csv" style={{ display: "none" }} onChange={onCSVFile} />
+          {actuals && <>
+            <button style={btn(false)} onClick={landActuals}>Land next month's actuals</button>
+            <button style={btn(false)} onClick={snapshotBudget}>Snapshot as Budget</button>
+          </>}
+          {actuals && <span style={{ fontSize: 12, color: T.sub, fontFamily: T.mono }}>{N} mo actuals · {H}-mo rolling forecast</span>}
+        </div>
+
+        {!actuals && (
+          <div style={{ ...card, padding: "28px 20px", color: T.sub }}>
+            <div style={{ textAlign: "center", marginBottom: 14 }}>
+              Load the sample model (3 segments, 12 months of actuals) or upload your own CSV.
+              Budget auto-snapshots — then edit drivers, land actuals, and watch everything recalculate.
+            </div>
+            <div style={{ fontSize: 12, maxWidth: 560, margin: "0 auto", lineHeight: 1.5 }}>
+              <b style={{ color: T.ink }}>CSV format</b> — first column is the date, each remaining column becomes a segment.
+              Monthly or daily rows both work (daily rows are summed into months). Minimum 6 months.
+              Growth drivers are seeded from each segment's trailing growth.
+              <div style={{ fontFamily: T.mono, marginTop: 6, background: "#F4F8F5", padding: "8px 10px", borderRadius: 6 }}>
+                month, A4 Copier, Record Paper, Notebooks<br/>
+                2025-07, 512, 305, 188<br/>
+                2025-08, 498, 311, 201
+              </div>
+            </div>
+          </div>
+        )}
+
+        {err && <div style={{ ...card, borderColor: T.pess, color: "#8A5A1E", fontSize: 13 }}>{err}</div>}
+
+        {actuals && plan && (
+          <>
+            {/* tabs */}
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <button style={tabBtn("dash")} onClick={() => setTab("dash")}>Dashboard</button>
+              <button style={tabBtn("plan")} onClick={() => setTab("plan")}>Plan &amp; drivers</button>
+              <button style={tabBtn("agent")} onClick={() => setTab("agent")}>AI agent</button>
+              <button style={tabBtn("workflow")} onClick={() => setTab("workflow")}>
+                Workflow{tasks.filter(t => t.status === "Open").length ? ` · ${tasks.filter(t => t.status === "Open").length}` : ""}
+              </button>
+              {selSeg && (
+                <button style={{ ...tabBtn(""), background: "#F4F8F5", color: T.green, border: `1px dashed ${T.green}` }} onClick={() => setSelSeg(null)}>
+                  Filter: {selSeg} ✕
+                </button>
+              )}
+            </div>
+
+            {tab === "dash" && (
+              <>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <KPI label={`6-mo forecast EV${selSeg ? " · " + selSeg : ""}`} value={fmtK(evTotal6)} sub={`prob ${probs.pess}/${probs.base}/${probs.opt}`} accent={T.mint} />
+                  <KPI label="vs Budget" value={budTotal6 ? fmtPct(((evTotal6 - budTotal6) / budTotal6) * 100) : "—"}
+                    sub={budTotal6 ? `${fmtK(evTotal6 - budTotal6)} vs snapshot` : "no budget"}
+                    accent={evTotal6 >= budTotal6 ? T.mint : T.red} />
+                  <KPI label="Forecast accuracy" value={mapeAcc != null ? mapeAcc.toFixed(1) + "%" : "—"} sub={accuracyLog.length ? `${accuracyLog.length} landed month(s)` : "land actuals to measure"} />
+                  <KPI label="Latest month" value={fmtK(selSeg ? actuals.values[selSeg][N - 1] : SEGS.reduce((a, s) => a + actuals.values[s][N - 1], 0))} sub="actual, last close" />
+                </div>
+
+                {/* scenario fan */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                    Actuals → scenario fan {selSeg ? `· ${selSeg}` : "· all segments"}
+                  </div>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <ComposedChart data={fanData} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke={T.line} vertical={false} />
+                      <XAxis dataKey="name" tick={{ fontSize: 9.5, fontFamily: T.mono }} />
+                      <YAxis tick={{ fontSize: 10, fontFamily: T.mono }} tickFormatter={v => "$" + v + "K"} width={56} />
+                      <Tooltip formatter={v => fmtK(v)} contentStyle={{ fontFamily: T.mono, fontSize: 12 }} />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <Line dataKey="actual" name="Actuals" stroke={T.ink} strokeWidth={2} dot={{ r: 2 }} />
+                      <Line dataKey="opt" name="Optimistic" stroke={T.opt} strokeDasharray="4 3" dot={false} />
+                      <Line dataKey="base" name="Base" stroke={T.mint} strokeWidth={2} dot={false} />
+                      <Line dataKey="pess" name="Pessimistic" stroke={T.pess} strokeDasharray="4 3" dot={false} />
+                      <Line dataKey="ev" name="Expected value" stroke={T.green} strokeWidth={2} strokeDasharray="1 3" dot={{ r: 3 }} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* variance bridge */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>
+                    Variance bridge · Budget → Forecast {bridgeMonth ? `(${bridgeMonth.key})` : ""}
+                  </div>
+                  <div style={{ fontSize: 11, color: T.sub, marginBottom: 6 }}>Segment deltas sum to the total — every beat or miss has a named cause.</div>
+                  {bridgeData.length ? (
+                    <ResponsiveContainer width="100%" height={220}>
+                      <BarChart data={bridgeData} margin={{ top: 16, right: 8, left: 0, bottom: 0 }}>
+                        <CartesianGrid stroke={T.line} vertical={false} />
+                        <XAxis dataKey="name" tick={{ fontSize: 10, fontFamily: T.mono }} />
+                        <YAxis tick={{ fontSize: 10, fontFamily: T.mono }} tickFormatter={v => "$" + v + "K"} width={56} domain={["auto", "auto"]} />
+                        <Tooltip contentStyle={{ fontFamily: T.mono, fontSize: 12 }}
+                          formatter={(v, n, p) => p.payload.kind === "delta" ? [(p.payload.delta >= 0 ? "+" : "−") + fmtK(Math.abs(p.payload.delta)).slice(1), "Δ vs budget"] : [fmtK(v), "Total"]} />
+                        <Bar dataKey="base" stackId="w" fill="transparent" />
+                        <Bar dataKey="val" stackId="w" radius={[3, 3, 0, 0]}>
+                          {bridgeData.map((r, i) => (
+                            <Cell key={i} fill={r.kind === "start" ? T.ink : r.kind === "end" ? T.green : r.delta >= 0 ? T.mint : T.red} />
+                          ))}
+                          <LabelList dataKey="val" position="top" style={{ fontSize: 10, fontFamily: T.mono }}
+                            formatter={(v) => v > 0 ? v : ""} />
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : <div style={{ fontSize: 12, color: T.sub }}>Snapshot a budget to see the bridge.</div>}
+                </div>
+
+                {/* segment variance table with cross-filter + conditional formatting */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>Segment variance · 6-month plan vs budget</div>
+                  <div style={{ fontSize: 11, color: T.sub, marginBottom: 6 }}>Tap a row to cross-filter every visual above.</div>
+                  <table>
+                    <thead><tr><th>Segment</th><th>Budget</th><th>Forecast EV</th><th>Var $</th><th>Var %</th></tr></thead>
+                    <tbody>
+                      {varTable.map(r => (
+                        <tr key={r.seg} onClick={() => setSelSeg(selSeg === r.seg ? null : r.seg)}
+                          style={{ cursor: "pointer", background: selSeg === r.seg ? "#F4F8F5" : "transparent" }}>
+                          <td style={{ fontWeight: 600 }}>
+                            <span style={{ display: "inline-block", width: 9, height: 9, borderRadius: 2, background: colorOf(r.seg), marginRight: 7 }} />
+                            {r.seg}
+                          </td>
+                          <td style={{ fontFamily: T.mono }}>{fmtK(r.bud)}</td>
+                          <td style={{ fontFamily: T.mono }}>{fmtK(r.fc)}</td>
+                          <td style={{ fontFamily: T.mono, color: r.v >= 0 ? T.mint : T.red }}>{(r.v >= 0 ? "+" : "−") + fmtK(Math.abs(r.v)).slice(1)}</td>
+                          <td style={{ fontFamily: T.mono, color: r.pct >= 0 ? T.mint : T.red, fontWeight: 600 }}>{fmtPct(r.pct)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            {tab === "plan" && (
+              <>
+                {/* driver grid */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>Growth drivers · % per month, per segment per scenario</div>
+                  <div style={{ fontSize: 11, color: T.sub, marginBottom: 8 }}>Edit any cell — the whole model recalculates live. Segment-level drivers, not line-item edits.</div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ minWidth: 420 }}>
+                      <thead><tr><th>Segment</th><th>Pessimistic</th><th>Base</th><th>Optimistic</th><th>Last actual</th></tr></thead>
+                      <tbody>
+                        {SEGS.map(s => (
+                          <tr key={s}>
+                            <td style={{ fontWeight: 600 }}>{s}</td>
+                            {["pess", "base", "opt"].map(sc => (
+                              <td key={sc}>
+                                <input type="number" step="0.1" value={drivers[s][sc]} style={numIn}
+                                  onChange={e => setDrivers(d => ({ ...d, [s]: { ...d[s], [sc]: parseFloat(e.target.value) || 0 } }))} />
+                              </td>
+                            ))}
+                            <td style={{ fontFamily: T.mono }}>{fmtK(actuals.values[s][N - 1])}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 12, color: T.sub }}>Scenario probabilities (%):</span>
+                    {["pess", "base", "opt"].map(sc => (
+                      <label key={sc} style={{ fontSize: 12, color: T.sub }}>
+                        {sc}&nbsp;
+                        <input type="number" value={probs[sc]} style={{ ...numIn, width: 52 }}
+                          onChange={e => setProbs(p => ({ ...p, [sc]: parseFloat(e.target.value) || 0 }))} />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* forecast grid with breakback */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>Forecast grid · EV by month, with breakback</div>
+                  <div style={{ fontSize: 11, color: T.sub, marginBottom: 8 }}>Edit a month's total — it spreads proportionally across segments and scenarios (top-down override on the bottom-up plan).</div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ minWidth: 460 }}>
+                      <thead>
+                        <tr><th>Month</th>{SEGS.map(s => <th key={s}>{s}</th>)}<th>Total EV (editable)</th></tr>
+                      </thead>
+                      <tbody>
+                        {plan.months.map(mo => (
+                          <tr key={mo.key} style={{ background: mo.overridden ? "#FBF6EC" : "transparent" }}>
+                            <td style={{ fontWeight: 600 }}>{mo.key}{mo.overridden && <span style={{ color: T.pess }} title="manual override"> ✎</span>}</td>
+                            {SEGS.map(s => <td key={s} style={{ fontFamily: T.mono }}>{Math.round(mo.perSeg[s].ev)}</td>)}
+                            <td>
+                              <input type="number" style={{ ...numIn, width: 84, fontWeight: 600 }}
+                                value={Math.round(mo.totals.ev)}
+                                onChange={e => setOverrideTotal(mo, e.target.value)} />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {Object.keys(overrides).length > 0 && (
+                    <button style={{ ...btn(false), marginTop: 10 }} onClick={() => setOverrides({})}>Reset overrides ⟲</button>
+                  )}
+                </div>
+
+                {/* versions & rolling forecast */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Versions &amp; rolling forecast</div>
+                  <div style={{ fontSize: 12.5, lineHeight: 1.6, color: T.sub }}>
+                    <b style={{ color: T.ink }}>Budget</b> is a locked snapshot ({Object.keys(budget).length} months held). <b style={{ color: T.ink }}>Working forecast</b> recalculates from drivers on every edit. Press <b style={{ color: T.ink }}>Land next month's actuals</b> to simulate close: the month books as actual, the forecast re-bases on the new anchor (not the stale budget), and prediction error is logged to the accuracy KPI.
+                  </div>
+                  {accuracyLog.length > 0 && (
+                    <table style={{ marginTop: 8 }}>
+                      <thead><tr><th>Landed month</th><th>Predicted EV</th><th>Actual</th><th>Error %</th></tr></thead>
+                      <tbody>
+                        {accuracyLog.map(a => {
+                          const e = Math.abs(a.actual - a.predicted) / a.actual * 100;
+                          return (
+                            <tr key={a.month}>
+                              <td style={{ fontWeight: 600 }}>{a.month}</td>
+                              <td style={{ fontFamily: T.mono }}>{fmtK(a.predicted)}</td>
+                              <td style={{ fontFamily: T.mono }}>{fmtK(a.actual)}</td>
+                              <td style={{ fontFamily: T.mono, color: e < 5 ? T.mint : T.pess }}>{e.toFixed(1)}%</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </>
+            )}
+
+            {tab === "agent" && (
+              <div style={{ ...card, borderTop: `3px solid ${T.green}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>AI agent · commentary &amp; Q&amp;A</div>
+                    <div style={{ fontSize: 11, color: T.sub }}>Generated from the live measures — drivers, variances, and the accuracy log — so it can't drift from the data.</div>
+                  </div>
+                  <button style={btn(true)} onClick={genCommentary} disabled={busy}>{busy ? "Working…" : "Generate commentary"}</button>
+                </div>
+
+                {commentary && (
+                  <div style={{ marginTop: 12, padding: 12, background: "#F4F8F5", borderRadius: 8, fontSize: 13, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+                    {commentary}
+                  </div>
+                )}
+
+                {chat.length > 0 && (
+                  <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8, maxHeight: 300, overflowY: "auto" }}>
+                    {chat.map((m, i) => (
+                      <div key={i} style={{
+                        alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                        maxWidth: "85%", padding: "8px 11px", borderRadius: 10, fontSize: 13, lineHeight: 1.5, whiteSpace: "pre-wrap",
+                        background: m.role === "user" ? T.green : "#F4F8F5", color: m.role === "user" ? "#fff" : T.ink,
+                      }}>{m.content}</div>
+                    ))}
+                    <div ref={chatEnd} />
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                  <input value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === "Enter" && ask()}
+                    placeholder='Ask — e.g. "why is Online driving the beat?" or "what if Wholesale base drops to 0%?"'
+                    style={{ flex: 1, padding: "10px 12px", border: `1px solid ${T.line}`, borderRadius: 8, fontSize: 13, fontFamily: T.sans }} />
+                  <button style={btn(false)} onClick={ask} disabled={busy}>Ask</button>
+                </div>
+              </div>
+            )}
+
+            {tab === "workflow" && (
+              <>
+                {/* autopilot + pipeline */}
+                <div style={{ ...card, borderTop: `3px solid ${T.green}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>Close automation pipeline</div>
+                      <div style={{ fontSize: 11, color: T.sub }}>When actuals land: re-base → commentary → notify manager → suggest actions → open review task.</div>
+                    </div>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: T.green, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                      <input type="checkbox" checked={autoPilot} onChange={e => setAutoPilot(e.target.checked)} />
+                      Autopilot
+                    </label>
+                  </div>
+                  {pipeline && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
+                      {pipeline.steps.map((s, i) => (
+                        <span key={i} style={{
+                          fontSize: 11, fontFamily: T.mono, padding: "5px 9px", borderRadius: 20,
+                          background: s.status === "done" ? "#E7F3ED" : s.status === "running" ? "#FBF6EC" : s.status === "error" ? "#F8E9E5" : "#F4F5F3",
+                          color: s.status === "done" ? T.green : s.status === "running" ? "#8A5A1E" : s.status === "error" ? T.red : T.sub,
+                          border: `1px solid ${s.status === "done" ? T.mint : T.line}`,
+                        }}>
+                          {s.status === "done" ? "✓ " : s.status === "running" ? "◌ " : s.status === "error" ? "✕ " : "· "}{s.label}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {!pipeline && <div style={{ fontSize: 12, color: T.sub, marginTop: 10 }}>Press "Land next month's actuals" to run the pipeline.</div>}
+                </div>
+
+                {/* suggested planning actions */}
+                {suggested.length > 0 && (
+                  <div style={{ ...card }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Suggested planning actions</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {suggested.map(a => (
+                        <div key={a.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: 10, background: "#F4F8F5", borderRadius: 8 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600 }}>{a.title}</div>
+                            <div style={{ fontSize: 12, color: T.sub, marginTop: 2 }}>{a.detail}</div>
+                          </div>
+                          <button style={btn(false)} onClick={() => logActionAsTask(a)}>Open task</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* manager notification / email draft */}
+                {emailDraft && (
+                  <div style={{ ...card }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>FP&A manager notification</div>
+                    <div style={{ fontSize: 12, fontFamily: T.mono, color: T.sub }}>Subject</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{emailDraft.subject}</div>
+                    <div style={{ fontSize: 13, lineHeight: 1.55, whiteSpace: "pre-wrap", background: "#F4F8F5", padding: 10, borderRadius: 8 }}>{emailDraft.body}</div>
+                    <a href={`mailto:?subject=${encodeURIComponent(emailDraft.subject)}&body=${encodeURIComponent(emailDraft.body)}`}
+                      style={{ ...btn(true), display: "inline-block", marginTop: 10, textDecoration: "none" }}>
+                      Open in email app
+                    </a>
+                  </div>
+                )}
+
+                {/* review tasks & approvals */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>Review tasks &amp; approvals</div>
+                  <div style={{ fontSize: 11, color: T.sub, marginBottom: 6 }}>Every close opens a review task. Approve to sign off the re-based forecast; reject to send it back to planning.</div>
+                  {tasks.length === 0 ? (
+                    <div style={{ fontSize: 12, color: T.sub }}>No tasks yet — land a month's actuals to open the first review.</div>
+                  ) : (
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ minWidth: 480 }}>
+                        <thead><tr><th>Task</th><th>Variance</th><th>Status</th><th>Action</th></tr></thead>
+                        <tbody>
+                          {tasks.map(t => (
+                            <tr key={t.id}>
+                              <td style={{ fontWeight: 600 }}>{t.title}</td>
+                              <td style={{ fontFamily: T.mono, color: t.variance == null ? T.sub : t.variance >= 0 ? T.mint : T.red }}>
+                                {t.variance == null ? "—" : fmtPct(t.variance)}
+                              </td>
+                              <td>
+                                <span style={{
+                                  fontSize: 11, fontFamily: T.mono, padding: "3px 8px", borderRadius: 20,
+                                  background: t.status === "Approved" ? "#E7F3ED" : t.status === "Rejected" ? "#F8E9E5" : "#FBF6EC",
+                                  color: t.status === "Approved" ? T.green : t.status === "Rejected" ? T.red : "#8A5A1E",
+                                }}>{t.status}</span>
+                              </td>
+                              <td style={{ whiteSpace: "nowrap" }}>
+                                {t.status === "Open" ? (
+                                  <>
+                                    <button style={{ ...btn(true), padding: "5px 9px", fontSize: 12 }} onClick={() => setTaskStatus(t.id, "Approved")}>Approve</button>
+                                    <button style={{ ...btn(false), padding: "5px 9px", fontSize: 12, marginLeft: 6, borderColor: T.red, color: T.red }} onClick={() => setTaskStatus(t.id, "Rejected")}>Reject</button>
+                                  </>
+                                ) : <span style={{ fontSize: 11, color: T.sub, fontFamily: T.mono }}>{t.closed ? t.closed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                {/* notifications feed */}
+                <div style={{ ...card }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Notifications</div>
+                  {notifications.length === 0 ? (
+                    <div style={{ fontSize: 12, color: T.sub }}>Nothing yet.</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 240, overflowY: "auto" }}>
+                      {notifications.map(n => (
+                        <div key={n.id} style={{ fontSize: 12.5, lineHeight: 1.45, display: "flex", gap: 8 }}>
+                          <span style={{ fontFamily: T.mono, fontSize: 11, color: T.sub, whiteSpace: "nowrap", paddingTop: 1 }}>
+                            {n.ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                          </span>
+                          <span style={{ color: n.type === "error" ? T.red : T.ink }}>{n.text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+
+            <div style={{ fontSize: 11, color: T.sub, textAlign: "center", paddingBottom: 12, fontFamily: T.mono }}>
+              Anaplan layer: drivers · versions · breakback · re-base — Power BI layer: KPIs · fan · bridge · cross-filter — Workflow layer: autopilot close · notifications · approvals
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
