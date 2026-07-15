@@ -57,7 +57,9 @@ LICENSE                       — MIT
 
 React single-page application with Recharts for visuals and the Anthropic API (Claude) as the embedded agent. The planning engine — anchoring, compounding drivers, probability weighting, breakback spreading, and holdout accuracy scoring — is implemented from scratch, so every number is traceable to a formula, not a black box.
 
-The methodology draws on my production experience: a daily sales forecasting model I ran for a Fortune 500 US healthcare retailer (day-of-week weighted, 12-week rolling window, 97.4% accuracy across 50 stakeholders) and multi-scenario Anaplan model design from my [connected-planning portfolio work](https://github.com/harshamuvvala18-max) on SEC-filed actuals.
+ This prototype is based on publicly known FP&A concepts including driver-based planning, rolling forecasts, scenario planning, variance analysis, and expected-value forecasting. It is intended as an educational demonstration of connected planning and AI-assisted finance workflows. No confidential company data, models, or proprietary business logic are included.
+
+A multi-scenario Anaplan model design from my [connected-planning portfolio work](https://github.com/harshamuvvala18-max) on SEC-filed actuals.
 
 ---
 
